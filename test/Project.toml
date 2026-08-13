@@ -1,10 +1,10 @@
 [deps]
 LazyArtifacts = "4af54fe1-eca0-43a8-85a7-787d91b784e3"
-Memento = "f28f55f0-a522-5efc-85c2-fe41dfb9b2d9"
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 PGLib = "07a8691f-3d11-4330-951b-3c50f98338be"
 PowerModels = "c36e90e8-916a-50a6-bd94-075b64ef4655"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [compat]
 PGLib = "~0.2"
-PowerModels = "~0.21"
+PowerModels = "~0.21.6"

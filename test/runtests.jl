@@ -1,11 +1,10 @@
-using ExaPowerIO, Test, PowerModels, PGLib, Memento
+using ExaPowerIO, Test, PowerModels, PGLib, Logging
 
-mutable struct StorageHandler{F} <: Handler{F}
-    records::Vector{String}
-    StorageHandler{F}() where F = new{F}([])
-end
-
-Memento.log(handler::StorageHandler, record::Memento.Record) = push!(handler.records, record.msg)
+# PowerModels emits its warnings through a private `ConsoleLogger` it installs on
+# itself, and wraps every call site in `with_logger`, so the global logger never
+# sees them. Pointing that logger at a buffer is the only way to read them back.
+const PM_LOG = IOBuffer()
+PowerModels._LOGGER[] = Logging.ConsoleLogger(PM_LOG, Logging.Info)
 
 @views function pglib_num_buses(s::String)
     s = s[length("pglib_opf_case")+1:end]
@@ -126,9 +125,9 @@ function compare_fields(lhs::L, rhs::R, fields) where {L,R}
     end
 end
 
-function test_case(ep_filtered, ep_unfiltered, pm_output, handler, dataset)
+function test_case(ep_filtered, ep_unfiltered, pm_output, pm_log, dataset)
     # when the reference bus gets changed, and there is a tie in pmax, the new ref is unknown
-    if any(map(r -> occursin("as reference based on generator", r), handler.records))
+    if occursin("as reference based on generator", pm_log)
         @info "Skipping case $dataset due to changed reference bus"
         return
     end
@@ -220,28 +219,25 @@ function test_case(ep_filtered, ep_unfiltered, pm_output, handler, dataset)
 end
 
 @testset "ExaPowerIO parsing tests" begin
-    root_logger = getlogger("")
-    handler = StorageHandler{DefaultFormatter}()
-    root_logger.handlers = Dict("storage_logger" => handler)
     PGLib_opf = ExaPowerIO.get_path(:pglib)
 
     for dataset in FILE_CASES
-        handler.records = []
+        take!(PM_LOG)
         @info "Testing with dataset: $dataset"
         ep_filtered = ExaPowerIO.parse_matpower(dataset)
         ep_unfiltered = ExaPowerIO.parse_matpower(dataset; filtered=false)
         pm_output = parse_pm(dataset, length(ep_unfiltered.branch))
-        test_case(ep_filtered, ep_unfiltered, pm_output, handler, dataset)
+        test_case(ep_filtered, ep_unfiltered, pm_output, String(take!(PM_LOG)), dataset)
     end
     for dataset in PGLIB_CASES
-        handler.records = []
+        take!(PM_LOG)
         @info "Testing with pglib dataset: $dataset"
         path = joinpath(PGLib_opf, dataset)
         @info path
         ep_filtered = ExaPowerIO.parse_matpower(dataset; library=:pglib)
         ep_unfiltered = ExaPowerIO.parse_matpower(dataset; library=:pglib, filtered=false)
         pm_output = parse_pm(path, length(ep_unfiltered.branch))
-        test_case(ep_filtered, ep_unfiltered, pm_output, handler, dataset)
+        test_case(ep_filtered, ep_unfiltered, pm_output, String(take!(PM_LOG)), dataset)
     end
 end
 
