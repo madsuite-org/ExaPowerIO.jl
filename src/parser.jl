@@ -378,7 +378,12 @@ end
     row_num = 1
     version = ""
     baseMVA :: T = T(0.0)
-    bus_map :: Vector{Int} = []
+    # `Int[]`, not `[]`. An untyped literal is a `Vector{Any}`, and the
+    # annotation then converts it — `convert(Vector{Int64}, ::Vector{Any})`
+    # copies element by element through a dynamic `setindex!`, which
+    # `juliac --trim=safe` refuses. Building it at the right element type
+    # costs nothing and removes the conversion entirely.
+    bus_map :: Vector{Int} = Int[]
     bus_offset :: Int = 0
     line_ind = 0
     num_branch = 0
