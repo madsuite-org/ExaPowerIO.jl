@@ -253,3 +253,5 @@ ROW_TYPES = [
         @test isbitstype(row_type)
     end
 end
+
+include("fast_number_tests.jl")
