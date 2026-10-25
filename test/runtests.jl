@@ -241,6 +241,24 @@ end
     end
 end
 
+@testset "CRLF line endings and indented comments" begin
+    # A case saved with CRLF line endings (or checked out with autocrlf) parses
+    # as the same case, and so does one whose comment rows are indented.
+    lf = "../data/case14_rate0_comments.m"
+    text = replace(read(lf, String), "\r\n" => "\n")
+    variants = (replace(text, "\n" => "\r\n"), replace(text, "\n%\t" => "\n  %\t"))
+    ref = ExaPowerIO.parse_matpower(lf)
+    for v in variants
+        path = tempname() * ".m"
+        write(path, v)
+        d = ExaPowerIO.parse_matpower(path)
+        @test d.bus == ref.bus
+        @test d.gen == ref.gen
+        @test d.branch == ref.branch
+        @test d.arc == ref.arc
+    end
+end
+
 ROW_TYPES = [
     BusData{Float64},
     GenData{Float64},

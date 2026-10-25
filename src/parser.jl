@@ -306,252 +306,90 @@ struct WordedString
     len :: Int
 end
 
-# Byte-indexed delimiter tables, indexed by byte+1 so byte 0x00 stays in range.
-# These beat the equivalent chain of byte comparisons by 7.9 ns/token measured
-# on case9241 (`bench/tokprobe.jl`, variant A vs B) -- the table is one load,
-# the comparison chain is a branch per delimiter. Keep the table.
-const ENDS_B = ntuple(i -> is_end(Char(i - 1)), 256)
-const SPACE_B = ntuple(i -> isspace(Char(i - 1)), 256)
+# Byte classes for the tokenizer, indexed by `byte + 1`. Only ASCII bytes are
+# classified, so a byte inside a multibyte character is never a delimiter
+# (`isspace(Char(0x85))` and `isspace(Char(0xa0))` are true, but 0x85 and 0xa0
+# are continuation bytes in UTF-8).
+const ENDS_B = ntuple(i -> i <= 128 && is_end(Char(i - 1)), 256)
+const SPACE_B = ntuple(i -> i <= 128 && isspace(Char(i - 1)), 256)
 
-# Tokenizer over raw code units. The previous version indexed the SubString by
-# CHARACTER (`ws.s[left]`), decoding UTF-8 on every access, and narrowed each
-# char through `Int8` -- which also throws on any byte > 127. MATPOWER numeric
-# rows are ASCII, so byte indexing is equivalent here and materially cheaper.
-# The bounds test now precedes the read: the old `isspace(ws.s[left]) && left
-# <= ws.len` read first and checked after, which under @inbounds reads one past
-# the end on a line of trailing blanks.
-@inline @inbounds function iter_ws(ws :: WordedString, start :: Int) :: Tuple{SubString{String}, Int}
+# The token starting at or after byte `start` of `ws`, and the byte after it.
+# Returns `(NULL_VIEW, 0)` at the end of the line or at a `%` comment.
+@inline function iter_ws(ws :: WordedString, start :: Int) :: Tuple{SubString{String}, Int}
     len = ws.len
     if start > len
         return (NULL_VIEW, 0)
     end
     str = ws.s
     left = start
-    while left <= len && SPACE_B[codeunit(str, left) + 1]
+    @inbounds while left <= len && SPACE_B[codeunit(str, left) + 1]
         left += 1
     end
-    if left > len || codeunit(str, left) == 0x25   # '%'
+    if left > len || @inbounds(codeunit(str, left)) == UInt8('%')
         return (NULL_VIEW, 0)
     end
     right = left
-    while right <= len && !ENDS_B[codeunit(str, right) + 1]
+    @inbounds while right <= len && !ENDS_B[codeunit(str, right) + 1]
         right += 1
     end
     # right is non-inclusive
-    if ENDS_B[codeunit(str, left) + 1]
+    if @inbounds ENDS_B[codeunit(str, left) + 1]
         right += 1
     end
-    (SubString(str, left, right - 1), right)
+    (SubString(str, left, thisind(str, right - 1)), right)
 end
 
-# --- exact fast number parsing ----------------------------------------------
-# Clinger's fast path: when the significand fits in 2^53 and the decimal
-# exponent is within +/-22, BOTH the significand and 10^|e| are exactly
-# representable in Float64, so one IEEE multiply (or divide) is correctly
-# rounded -- bit-identical to Base.parse, not an approximation. Every other
-# shape -- oversized mantissa, big exponent, hex, Inf/NaN, trailing garbage --
-# returns `nothing` and falls back to Base.parse. So this path can only be
-# faster, never different; `bench/fuzz_numbers.jl` checks that claim directly.
 const POW10_EXACT = ntuple(i -> 10.0^(i - 1), 23)   # 10^0 .. 10^22, each exact
 
-@inline function _fast_float(s::SubString{String})
-    n = ncodeunits(s)
-    n == 0 && return nothing
-    i = 1
-    b = codeunit(s, i)
-    neg = false
-    if b == 0x2d          # '-'
-        neg = true; i += 1
-    elseif b == 0x2b      # '+'
-        i += 1
-    end
-    i > n && return nothing
-    mant = UInt64(0); ndig = 0; frac = 0; seen = false
-    while i <= n
+@inline isdigit_b(b::UInt8) = 0x30 <= b <= 0x39
+
+# Reads a decimal number from code units `i:n` of `s` and returns `(value, next)`,
+# where `next` is the index of the first byte not read, or `nothing` if no number
+# starts at `i` or it cannot be read exactly. It reads exactly when the significand
+# has at most 18 digits and is at most 2^53, and the decimal exponent is within ±22.
+# Then the significand and 10^|e| are both exact Float64 values, so one multiply or
+# divide is correctly rounded and the value is bit-identical to `parse(Float64, ...)`
+# (Clinger's fast path). Requires `1 <= i` and `n <= ncodeunits(s)`.
+@inline function scan_float(s::SubString{String}, i::Int, n::Int)
+    @inbounds begin
+        i > n && return nothing
         b = codeunit(s, i)
-        (b < 0x30 || b > 0x39) && break
-        ndig += 1
-        ndig > 18 && return nothing      # bail out before UInt64 could overflow
-        mant = mant * 10 + (b - 0x30)
-        seen = true; i += 1
-    end
-    if i <= n && codeunit(s, i) == 0x2e  # '.'
-        i += 1
-        while i <= n
-            b = codeunit(s, i)
-            (b < 0x30 || b > 0x39) && break
+        neg = b == UInt8('-')
+        (neg || b == UInt8('+')) && (i += 1)
+        mant = UInt64(0); ndig = 0; frac = 0
+        while i <= n && isdigit_b(codeunit(s, i))
             ndig += 1
-            ndig > 18 && return nothing
-            mant = mant * 10 + (b - 0x30)
-            frac += 1; seen = true; i += 1
+            ndig > 18 && return nothing   # before mant can overflow UInt64
+            mant = mant * 10 + (codeunit(s, i) - 0x30)
+            i += 1
         end
-    end
-    seen || return nothing
-    exp10 = -frac
-    if i <= n
-        b = codeunit(s, i)
-        if b == 0x65 || b == 0x45        # 'e' / 'E'
+        if i <= n && codeunit(s, i) == UInt8('.')
+            i += 1
+            while i <= n && isdigit_b(codeunit(s, i))
+                ndig += 1
+                ndig > 18 && return nothing
+                mant = mant * 10 + (codeunit(s, i) - 0x30)
+                frac += 1; i += 1
+            end
+        end
+        ndig == 0 && return nothing
+        exp10 = -frac
+        if i <= n && (codeunit(s, i) == UInt8('e') || codeunit(s, i) == UInt8('E'))
             i += 1
             i > n && return nothing
             b = codeunit(s, i)
-            eneg = false
-            if b == 0x2d
-                eneg = true; i += 1
-            elseif b == 0x2b
-                i += 1
-            end
-            i > n && return nothing
-            ev = 0; eseen = false
-            while i <= n
-                b = codeunit(s, i)
-                (b < 0x30 || b > 0x39) && break
-                ev = ev * 10 + Int(b - 0x30)
+            eneg = b == UInt8('-')
+            (eneg || b == UInt8('+')) && (i += 1)
+            ev = 0; edig = 0
+            while i <= n && isdigit_b(codeunit(s, i))
+                ev = ev * 10 + Int(codeunit(s, i) - 0x30)
                 ev > 1000 && return nothing
-                eseen = true; i += 1
+                edig += 1; i += 1
             end
-            eseen || return nothing
+            edig == 0 && return nothing
             exp10 += eneg ? -ev : ev
         end
-    end
-    i <= n && return nothing             # trailing garbage -> let Base decide
-    mant > (UInt64(1) << 53) && return nothing
-    m = Float64(mant)
-    if exp10 == 0
-        v = m
-    elseif 0 < exp10 <= 22
-        v = m * POW10_EXACT[exp10 + 1]
-    elseif -22 <= exp10 < 0
-        v = m / POW10_EXACT[-exp10 + 1]
-    else
-        return nothing
-    end
-    return neg ? -v : v
-end
-
-@inline function _fast_int(s::SubString{String})
-    n = ncodeunits(s)
-    n == 0 && return nothing
-    i = 1
-    b = codeunit(s, i)
-    neg = false
-    if b == 0x2d
-        neg = true; i += 1
-    elseif b == 0x2b
-        i += 1
-    end
-    i > n && return nothing
-    v = 0; nd = 0
-    while i <= n
-        b = codeunit(s, i)
-        (b < 0x30 || b > 0x39) && return nothing
-        nd += 1
-        nd > 18 && return nothing
-        v = v * 10 + Int(b - 0x30)
-        i += 1
-    end
-    nd == 0 && return nothing
-    return neg ? -v : v
-end
-
-# Only Float64 and Int get a fast path; every other T goes straight to
-# Base.parse, so generic-precision parsing (Float32, BigFloat, ...) is
-# bit-for-bit untouched by this.
-# Fused scan-and-parse. `iter_ws` walks a token's bytes to find where it ends,
-# and `_fast_float` then walks the SAME bytes again to read the digits. For the
-# numeric rows -- which are ~93% of all tokens in a MATPOWER file -- one pass
-# can do both: accumulate the significand while scanning, and stop at the
-# delimiter that would have ended the token anyway.
-#
-# `nextpos` is exactly what `iter_ws` would have returned, so callers cannot
-# tell the two apart. Any shape the fused path does not handle (comment, empty,
-# oversized mantissa, exponent out of range, trailing garbage) rewinds and
-# takes the original `iter_ws` + `fast_parse` route, so behaviour is identical
-# by construction -- the fused path is an accelerator, never a second parser
-# with its own opinion. `bench/fuse_equiv.jl` checks value AND nextpos agree
-# token-for-token over every pglib case.
-# `start == 0` means the previous field consumed the last token on the line.
-# The old macro special-cased that with `state[2] == 0 ? (NULL_VIEW, 0) : ...`,
-# so a short row raised "cannot parse \"\" as Float64" from Base. Reproduce that
-# exactly: without this guard we would index the line at offset 0 under
-# @inbounds, which reads out of bounds instead of raising. A well-formed file
-# never reaches here, so no amount of pglib data would have caught it.
-@inline function iter_num(::Type{T}, ws::WordedString, start::Int) where {T}
-    start < 1 && return (fast_parse(T, NULL_VIEW), 0)
-    tok, nxt = iter_ws(ws, start)
-    return (fast_parse(T, tok), nxt)
-end
-
-@inline function iter_num(::Type{Float64}, ws::WordedString, start::Int)
-    @inbounds begin
-        len = ws.len
-        (start < 1 || start > len) && return _iter_num_slow(Float64, ws, start)
-        str = ws.s
-        i = start
-        while i <= len && SPACE_B[codeunit(str, i) + 1]
-            i += 1
-        end
-        (i > len || codeunit(str, i) == 0x25) && return _iter_num_slow(Float64, ws, start)
-        b = codeunit(str, i)
-        neg = false
-        if b == 0x2d
-            neg = true; i += 1
-        elseif b == 0x2b
-            i += 1
-        end
-        i > len && return _iter_num_slow(Float64, ws, start)
-        mant = UInt64(0); ndig = 0; frac = 0; seen = false
-        while i <= len
-            b = codeunit(str, i)
-            (b < 0x30 || b > 0x39) && break
-            ndig += 1
-            ndig > 18 && return _iter_num_slow(Float64, ws, start)
-            mant = mant * 10 + (b - 0x30)
-            seen = true; i += 1
-        end
-        if i <= len && codeunit(str, i) == 0x2e
-            i += 1
-            while i <= len
-                b = codeunit(str, i)
-                (b < 0x30 || b > 0x39) && break
-                ndig += 1
-                ndig > 18 && return _iter_num_slow(Float64, ws, start)
-                mant = mant * 10 + (b - 0x30)
-                frac += 1; seen = true; i += 1
-            end
-        end
-        seen || return _iter_num_slow(Float64, ws, start)
-        exp10 = -frac
-        if i <= len
-            b = codeunit(str, i)
-            if b == 0x65 || b == 0x45
-                i += 1
-                i > len && return _iter_num_slow(Float64, ws, start)
-                b = codeunit(str, i)
-                eneg = false
-                if b == 0x2d
-                    eneg = true; i += 1
-                elseif b == 0x2b
-                    i += 1
-                end
-                i > len && return _iter_num_slow(Float64, ws, start)
-                ev = 0; eseen = false
-                while i <= len
-                    b = codeunit(str, i)
-                    (b < 0x30 || b > 0x39) && break
-                    ev = ev * 10 + Int(b - 0x30)
-                    ev > 1000 && return _iter_num_slow(Float64, ws, start)
-                    eseen = true; i += 1
-                end
-                eseen || return _iter_num_slow(Float64, ws, start)
-                exp10 += eneg ? -ev : ev
-            end
-        end
-        # the token must end HERE, at a real delimiter (or end of line), or the
-        # original tokenizer would have taken more bytes than we just consumed
-        if i <= len && !ENDS_B[codeunit(str, i) + 1]
-            return _iter_num_slow(Float64, ws, start)
-        end
-        mant > (UInt64(1) << 53) && return _iter_num_slow(Float64, ws, start)
+        mant > (UInt64(1) << 53) && return nothing
         m = Float64(mant)
         if exp10 == 0
             v = m
@@ -560,18 +398,42 @@ end
         elseif -22 <= exp10 < 0
             v = m / POW10_EXACT[-exp10 + 1]
         else
-            return _iter_num_slow(Float64, ws, start)
+            return nothing
         end
         return (neg ? -v : v, i)
     end
 end
 
-@noinline function _iter_num_slow(::Type{T}, ws::WordedString, start::Int) where {T}
-    start < 1 && return (fast_parse(T, NULL_VIEW), 0)
-    tok, nxt = iter_ws(ws, start)
-    return (fast_parse(T, tok), nxt)
+# `s` as a Float64 if `scan_float` reads all of it, else `nothing`.
+@inline function _fast_float(s::SubString{String})
+    n = ncodeunits(s)
+    r = scan_float(s, 1, n)
+    (r === nothing || r[2] != n + 1) && return nothing
+    return r[1]
 end
 
+# `s` as an Int if it is an optional sign followed by at most 18 digits, else `nothing`.
+@inline function _fast_int(s::SubString{String})
+    n = ncodeunits(s)
+    n == 0 && return nothing
+    i = 1
+    b = codeunit(s, i)
+    neg = b == UInt8('-')
+    (neg || b == UInt8('+')) && (i += 1)
+    i > n && return nothing
+    n - i + 1 > 18 && return nothing
+    v = 0
+    @inbounds while i <= n
+        b = codeunit(s, i)
+        isdigit_b(b) || return nothing
+        v = v * 10 + Int(b - 0x30)
+        i += 1
+    end
+    return neg ? -v : v
+end
+
+# `parse(T, s)`, reading Float64 and Int without `Base.parse` when `s` is in the
+# form `_fast_float` or `_fast_int` reads.
 @inline fast_parse(::Type{T}, s::SubString{String}) where {T} = parse(T, s)
 @inline function fast_parse(::Type{Float64}, s::SubString{String})
     v = _fast_float(s)
@@ -580,6 +442,40 @@ end
 @inline function fast_parse(::Type{Int}, s::SubString{String})
     v = _fast_int(s)
     return v === nothing ? parse(Int, s) : v
+end
+
+# The token at `start` parsed as a `T`, and the position after it, as returned by
+# `iter_ws`. `start == 0` means the previous field ended the line, so the row has
+# fewer fields than its section declares; this raises the error `parse` gives on an
+# empty token.
+@noinline function parse_token(::Type{T}, ws::WordedString, start::Int) where {T}
+    start < 1 && return (fast_parse(T, NULL_VIEW), 0)
+    tok, nxt = iter_ws(ws, start)
+    return (fast_parse(T, tok), nxt)
+end
+
+@inline iter_num(::Type{T}, ws::WordedString, start::Int) where {T} = parse_token(T, ws, start)
+
+# For Float64, the token is scanned and parsed in one pass. The result is the same
+# value and position as `parse_token`: a number `scan_float` reads exactly that ends
+# at a delimiter or the end of the line. Anything else goes to `parse_token`.
+@inline function iter_num(::Type{Float64}, ws::WordedString, start::Int)
+    len = ws.len
+    if 1 <= start <= len
+        str = ws.s
+        i = start
+        @inbounds while i <= len && SPACE_B[codeunit(str, i) + 1]
+            i += 1
+        end
+        if i <= len && @inbounds(codeunit(str, i)) != UInt8('%')
+            r = scan_float(str, i, len)
+            if r !== nothing
+                v, j = r
+                (j > len || @inbounds(ENDS_B[codeunit(str, j) + 1])) && return (v, j)
+            end
+        end
+    end
+    return parse_token(Float64, ws, start)
 end
 
 macro iter_to_ntuple(n, iter_expr, types)
@@ -606,32 +502,41 @@ macro iter_to_ntuple(n, iter_expr, types)
     return Expr(:block, body...)
 end
 
-# Walk the '\n'-separated lines of `s` without materializing them. Semantics
-# match `split(s, "\n")` exactly -- including the single empty trailing field
-# when `s` ends in a newline -- so line numbering and array lengths are
-# unchanged. `\r` is left on the line, as `split` leaves it, so CRLF files
-# behave exactly as before.
+# The line of `s` starting at byte `pos`, and the byte after its newline, or
+# `nothing` past the last line. The lines are those of
+# `split(replace(s, "\r\n" => "\n"), "\n")`: a `\r` before a newline is dropped,
+# and a string ending in a newline has an empty last line.
 @inline function next_line(s::String, pos::Int, n::Int)
     if pos > n
-        # `split` emits one empty final field iff the input ended with a
-        # newline (and one for the empty input); anything past that is done.
         (pos == n + 1 && (n == 0 || codeunit(s, n) == 0x0a)) &&
             return (SubString(s, n + 1, n), n + 2)
         return nothing
     end
-    # Search the CODE UNITS, not the String. `findnext('\n', ::String, ...)`
-    # goes through the character-oriented path; the byte form dispatches to
-    # memchr and is 29% faster per line (41.1 vs 57.7 ns, bench/lineprobe.jl).
-    # A hand-rolled byte loop is much SLOWER (92 ns) -- it gives up the SIMD
-    # memchr -- so this is the fast form, not an intermediate step.
+    # `findnext` over the code units uses memchr; over the String it decodes characters.
     nl = findnext(==(0x0a), codeunits(s), pos)
-    nl === nothing && return (SubString(s, pos, n), n + 1)
-    return (SubString(s, pos, nl - 1), nl + 1)
+    # `thisind`: a line can end in a multibyte character, and a SubString must end
+    # at the first byte of its last character.
+    nl === nothing && return (SubString(s, pos, thisind(s, n)), n + 1)
+    last = nl > pos && codeunit(s, nl - 1) == 0x0d ? nl - 2 : nl - 1
+    return (SubString(s, pos, thisind(s, last)), nl + 1)
 end
 
-# `pos` is the byte offset of the line FOLLOWING the "mpc.<key> = [" line,
-# which is where the original counted from. Returns the number of data rows
-# before the closing "]". Indexing an empty line raises, exactly as before.
+# Byte index of the first non-whitespace character of `line`, or 0 if it is blank.
+@inline function first_nonspace(line::SubString{String})
+    n = ncodeunits(line)
+    i = 1
+    @inbounds while i <= n
+        b = codeunit(line, i)
+        b >= 0x80 && return something(findnext(!isspace, line, i), 0)
+        SPACE_B[b + 1] || return i
+        i += 1
+    end
+    return 0
+end
+
+# The number of rows in the table whose first line starts at byte `pos`: the lines
+# the parsing loop reads as rows, so blank lines and `%` comment lines inside a
+# table are not counted.
 function get_arr_len(s::String, n::Int, pos::Int)::Int
     count = 0
     p = pos
@@ -639,17 +544,27 @@ function get_arr_len(s::String, n::Int, pos::Int)::Int
         nxt = next_line(s, p, n)
         nxt === nothing && error("Array beginning at byte $pos was not closed")
         line, p = nxt
+        k = first_nonspace(line)
+        k == 0 && continue
         line[1] == ']' && return count
-        count += 1
+        codeunit(line, k) == UInt8('%') || (count += 1)
     end
 end
 
+# MATPOWER reads a `rateA` of 0 as no limit. Like PowerModels' `calc_thermal_limits!`,
+# replace it with a limit the voltage and angle-difference bounds already imply. The
+# angle difference is capped at pi, where the voltage difference is largest, so a case
+# with MATPOWER's unconstrained -360/360 gets the widest such limit rather than one near 0.
+function thermal_limit(r::T, x::T, angmin::T, angmax::T, fr_vmax::T, to_vmax::T) where {T}
+    theta_max = min(max(abs(angmin), abs(angmax)), T(pi))
+    z2 = r^2 + x^2
+    y_mag = iszero(z2) ? zero(T) : inv(sqrt(z2))
+    m_vmax = max(fr_vmax, to_vmax)
+    c_max = sqrt(fr_vmax^2 + to_vmax^2 - 2 * fr_vmax * to_vmax * cos(theta_max))
+    return y_mag * m_vmax * c_max
+end
+
 @inbounds @inline @views function parse_matpower_inner(::Type{T}, ::Type{V}, fname :: String, filtered :: Bool) where {T<:Real, V<:AbstractVector}
-    # `read(open(fname), String)` never closed the stream; `read(fname, String)`
-    # does. The line vector is gone -- the parser only ever walks forward.
-    # Measured on case9241 (4.75 MiB, node 000): dropping it saves 5.03 MiB of
-    # the 15.54 MiB the parse allocated, and 3.1 ms of 89.6 ms. The memory is
-    # the point here; the time is a rounding error next to tokenizing.
     fstring = read(fname, String)
     nbytes = ncodeunits(fstring)
     in_array = false
@@ -681,16 +596,14 @@ end
     while true
         nxt = next_line(fstring, pos, nbytes)
         nxt === nothing && break
-        # advance the cursor BEFORE the body -- the body uses `continue`, and
-        # `pos` must already point at the next line for `get_arr_len` anyway.
+        # `pos` now points at the next line, which is where `get_arr_len` starts.
         line, pos = nxt
         line_len = line.ncodeunits
         line_ind += 1
-        line_len != 0 && codeunit(line, 1) == 0x25 && continue   # '%'
-        if in_array && line_len != 0
-            # exactly `startswith(line, "];")`, as two byte compares -- this runs
-            # once per data row, not once per array
-            if line_len >= 2 && codeunit(line, 1) == 0x5d && codeunit(line, 2) == 0x3b
+        k = first_nonspace(line)
+        k != 0 && codeunit(line, k) == UInt8('%') && continue
+        if in_array && k != 0
+            if startswith(line, "];")
                 if cur_key == "bus"
                     bus_offset = minimum(b -> b.bus_i, bus) - 1
                     max_bus = maximum(b -> b.bus_i, bus)
@@ -787,24 +700,33 @@ end
                 )
             elseif cur_key == "branch"
                 branch_words = @iter_to_ntuple 13 WordedString(line, line_len) (Int, Int, T, T, T, T, T, T, T, T, Int, T, T)
+                f_bus = bus_map[branch_words[1] - bus_offset]
+                t_bus = bus_map[branch_words[2] - bus_offset]
+                angmin = branch_words[12] / T(180.0) * T(pi)
+                angmax = branch_words[13] / T(180.0) * T(pi)
+                rate_a = branch_words[6] / baseMVA
+                if rate_a <= 0
+                    rate_a = thermal_limit(branch_words[3], branch_words[4], angmin, angmax,
+                                           bus[f_bus].vmax, bus[t_bus].vmax)
+                end
                 branch[row_num] = BranchData{T}(
                     row_num,
-                    bus_map[branch_words[1] - bus_offset],
-                    bus_map[branch_words[2] - bus_offset],
+                    f_bus,
+                    t_bus,
                     branch_words[3],
                     branch_words[4],
                     branch_words[5] / T(2.0),
                     branch_words[5] / T(2.0),
                     T(0.0),
                     T(0.0),
-                    branch_words[6] / baseMVA,
+                    rate_a,
                     branch_words[7] / baseMVA,
                     branch_words[8] / baseMVA,
                     branch_words[9],
                     (branch_words[10]) / T(180.0) * T(pi),
                     branch_words[11],
-                    branch_words[12] / T(180.0) * T(pi),
-                    branch_words[13] / T(180.0) * T(pi),
+                    angmin,
+                    angmax,
                     cur_branch,
                     cur_branch + num_branch
                 )
@@ -949,37 +871,22 @@ end
         )
     end
 
-    # `num_branch` still holds the DECLARED row count here; `t_idx` was computed
-    # against it as `cur_branch + num_branch` while rows were read. Filtering
-    # `pop!`s inactive branches, so if any were dropped the final count differs
-    # and every `t_idx` is stale -- that, and only that, is why the rewrite
-    # below exists. When nothing was dropped the values are already right, and
-    # the rewrite is pure cost: it rebuilds a 216-byte struct per branch AND
-    # recomputes all eight admittance coefficients through the 19-argument
-    # constructor. Skip it in that case.
-    branch_declared = num_branch
+    # `t_idx` was set to `f_idx` plus the declared branch count. If filtering dropped
+    # branches, it is reset to `f_idx` plus the remaining count.
+    num_declared = num_branch
     num_branch = length(branch)
+    fix_t_idx = num_branch != num_declared
     arc = V{ArcData{T}}(undef, num_branch * 2)
-    needs_tidx_fix = filtered && num_branch != branch_declared
-    # `b` from the iterator already IS branch[i]; the previous version wrote
-    # `branch[i].<field>` nineteen times per row, reloading a 27-field struct
-    # from the array on every single field access. `filtered` is loop-invariant
-    # so it is hoisted out rather than retested once per branch.
-    if needs_tidx_fix
-        for (i, b) in enumerate(branch)
+    for (i, b) in enumerate(branch)
+        if fix_t_idx
             branch[i] = BranchData{T}(
                 b.i, b.f_bus, b.t_bus, b.br_r, b.br_x, b.b_fr, b.b_to,
                 b.g_fr, b.g_to, b.rate_a, b.rate_b, b.rate_c, b.tap, b.shift,
                 b.status, b.angmin, b.angmax, b.f_idx, b.f_idx + num_branch,
             )
-            arc[i] = ArcData(i, b.f_bus, b.rate_a)
-            arc[i+num_branch] = ArcData(i+num_branch, b.t_bus, b.rate_a)
         end
-    else
-        for (i, b) in enumerate(branch)
-            arc[i] = ArcData(i, b.f_bus, b.rate_a)
-            arc[i+num_branch] = ArcData(i+num_branch, b.t_bus, b.rate_a)
-        end
+        arc[i] = ArcData(i, b.f_bus, b.rate_a)
+        arc[i+num_branch] = ArcData(i+num_branch, b.t_bus, b.rate_a)
     end
 
     return PowerData(version, baseMVA, bus, gen, branch, arc, storage)
