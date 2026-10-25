@@ -2,14 +2,14 @@
 
 ExaPowerIO is a minimal IO library for the [Matpower](https://matpower.app/manual/matpower/DataFileFormat.html) file format.
 
-![CI](https://github.com/MadNLP/ExaPowerIO.jl/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/madsuite-org/ExaPowerIO.jl/actions/workflows/ci.yml/badge.svg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![doc](https://img.shields.io/badge/docs-stable-blue.svg)](https://madsuite.org/ExaPowerIO.jl/stable) 
 [![doc](https://img.shields.io/badge/docs-dev-blue.svg)](https://madsuite.org/ExaPowerIO.jl/dev) 
-[![codecov](https://codecov.io/gh/MadNLP/ExaPowerIO.jl/graph/badge.svg?token=K5h7QkiI2g)](https://codecov.io/gh/MadNLP/ExaPowerIO.jl)
+[![codecov](https://codecov.io/gh/madsuite-org/ExaPowerIO.jl/graph/badge.svg)](https://codecov.io/gh/madsuite-org/ExaPowerIO.jl)
 
 DICLAIMER: ExaPowerIO is in active development. There may be missing features, documentation, or other issues.
-If you experience any of these, please open [Issues](https://github.com/MadNLP/ExaPowerIO.jl/issues), or [Pull Requests](https://github.com/MadNLP/ExaPowerIO.jl/pulls)
+If you experience any of these, please open [Issues](https://github.com/madsuite-org/ExaPowerIO.jl/issues), or [Pull Requests](https://github.com/madsuite-org/ExaPowerIO.jl/pulls)
 
 ### Usage
 If you are interested in trying ExaPowerIO, please see the [Usage Documentation](https://madsuite.org/ExaPowerIO.jl/stable/user/) for information on using the functions / structs exported by ExaPowerIO.
