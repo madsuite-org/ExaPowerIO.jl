@@ -1,9 +1,9 @@
 # Introduction
 
-This is the documentation of [ExaPowerIO.jl](https://github.com/MadNLP/ExaPowerIO.jl/tree/main).
+This is the documentation of [ExaPowerIO.jl](https://github.com/madsuite-org/ExaPowerIO.jl/tree/main).
 
 DICLAIMER: ExaPowerIO is in active development. There may be missing features, documentation, or other issues.
-If you experience any of these, please open [Issues](https://github.com/MadNLP/ExaPowerIO.jl/issues), or [Pull Requests](https://github.com/MadNLP/ExaPowerIO.jl/pulls)
+If you experience any of these, please open [Issues](https://github.com/madsuite-org/ExaPowerIO.jl/issues), or [Pull Requests](https://github.com/madsuite-org/ExaPowerIO.jl/pulls)
 
 ### What does ExaPowerIO do?
 ExaPowerIO was created with the goal of being a low-scope IO package for working with the [Matpower File Format](https://matpower.app/manual/matpower/DataFileFormat.html).
