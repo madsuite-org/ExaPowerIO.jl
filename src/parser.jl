@@ -298,9 +298,7 @@ end
 
 const MATPOWER_KEYS :: Vector{String} = ["version", "baseMVA", "areas", "bus", "gencost", "gen", "branch", "storage"];
 const NULL_VIEW::SubString{String} = SubString("", 1, 0)
-const PRINTABLE_ASCII = 256
 is_end(c::Char) = isspace(c) || c in "=;[]%"
-const ENDS = ntuple(i -> is_end(Char(i)), PRINTABLE_ASCII)
 const KEY_MIN_LEN = 4
 
 struct WordedString
@@ -308,27 +306,176 @@ struct WordedString
     len :: Int
 end
 
-@inbounds @views function iter_ws(ws :: WordedString, start :: Int) :: Tuple{SubString{String}, Int}
-    if start > ws.len
+# Byte classes for the tokenizer, indexed by `byte + 1`. Only ASCII bytes are
+# classified, so a byte inside a multibyte character is never a delimiter
+# (`isspace(Char(0x85))` and `isspace(Char(0xa0))` are true, but 0x85 and 0xa0
+# are continuation bytes in UTF-8).
+const ENDS_B = ntuple(i -> i <= 128 && is_end(Char(i - 1)), 256)
+const SPACE_B = ntuple(i -> i <= 128 && isspace(Char(i - 1)), 256)
+
+# The token starting at or after byte `start` of `ws`, and the byte after it.
+# Returns `(NULL_VIEW, 0)` at the end of the line or at a `%` comment.
+@inline function iter_ws(ws :: WordedString, start :: Int) :: Tuple{SubString{String}, Int}
+    len = ws.len
+    if start > len
         return (NULL_VIEW, 0)
     end
+    str = ws.s
     left = start
-    while isspace(ws.s[left]) && left <= ws.len
+    @inbounds while left <= len && SPACE_B[codeunit(str, left) + 1]
         left += 1
     end
-    if left > ws.len || ws.s[left] == '%'
+    if left > len || @inbounds(codeunit(str, left)) == UInt8('%')
         return (NULL_VIEW, 0)
     end
     right = left
-    should_end = c -> ENDS[c]
-    while right <= ws.len && !should_end(Int8(ws.s[right]))
+    @inbounds while right <= len && !ENDS_B[codeunit(str, right) + 1]
         right += 1
     end
     # right is non-inclusive
-    if should_end(Int8(ws.s[left]))
+    if @inbounds ENDS_B[codeunit(str, left) + 1]
         right += 1
     end
-    (ws.s[left:right-1], right)
+    (SubString(str, left, thisind(str, right - 1)), right)
+end
+
+const POW10_EXACT = ntuple(i -> 10.0^(i - 1), 23)   # 10^0 .. 10^22, each exact
+
+@inline isdigit_b(b::UInt8) = 0x30 <= b <= 0x39
+
+# Reads a decimal number from code units `i:n` of `s` and returns `(value, next)`,
+# where `next` is the index of the first byte not read, or `nothing` if no number
+# starts at `i` or it cannot be read exactly. It reads exactly when the significand
+# has at most 18 digits and is at most 2^53, and the decimal exponent is within ±22.
+# Then the significand and 10^|e| are both exact Float64 values, so one multiply or
+# divide is correctly rounded and the value is bit-identical to `parse(Float64, ...)`
+# (Clinger's fast path). Requires `1 <= i` and `n <= ncodeunits(s)`.
+@inline function scan_float(s::SubString{String}, i::Int, n::Int)
+    @inbounds begin
+        i > n && return nothing
+        b = codeunit(s, i)
+        neg = b == UInt8('-')
+        (neg || b == UInt8('+')) && (i += 1)
+        mant = UInt64(0); ndig = 0; frac = 0
+        while i <= n && isdigit_b(codeunit(s, i))
+            ndig += 1
+            ndig > 18 && return nothing   # before mant can overflow UInt64
+            mant = mant * 10 + (codeunit(s, i) - 0x30)
+            i += 1
+        end
+        if i <= n && codeunit(s, i) == UInt8('.')
+            i += 1
+            while i <= n && isdigit_b(codeunit(s, i))
+                ndig += 1
+                ndig > 18 && return nothing
+                mant = mant * 10 + (codeunit(s, i) - 0x30)
+                frac += 1; i += 1
+            end
+        end
+        ndig == 0 && return nothing
+        exp10 = -frac
+        if i <= n && (codeunit(s, i) == UInt8('e') || codeunit(s, i) == UInt8('E'))
+            i += 1
+            i > n && return nothing
+            b = codeunit(s, i)
+            eneg = b == UInt8('-')
+            (eneg || b == UInt8('+')) && (i += 1)
+            ev = 0; edig = 0
+            while i <= n && isdigit_b(codeunit(s, i))
+                ev = ev * 10 + Int(codeunit(s, i) - 0x30)
+                ev > 1000 && return nothing
+                edig += 1; i += 1
+            end
+            edig == 0 && return nothing
+            exp10 += eneg ? -ev : ev
+        end
+        mant > (UInt64(1) << 53) && return nothing
+        m = Float64(mant)
+        if exp10 == 0
+            v = m
+        elseif 0 < exp10 <= 22
+            v = m * POW10_EXACT[exp10 + 1]
+        elseif -22 <= exp10 < 0
+            v = m / POW10_EXACT[-exp10 + 1]
+        else
+            return nothing
+        end
+        return (neg ? -v : v, i)
+    end
+end
+
+# `s` as a Float64 if `scan_float` reads all of it, else `nothing`.
+@inline function _fast_float(s::SubString{String})
+    n = ncodeunits(s)
+    r = scan_float(s, 1, n)
+    (r === nothing || r[2] != n + 1) && return nothing
+    return r[1]
+end
+
+# `s` as an Int if it is an optional sign followed by at most 18 digits, else `nothing`.
+@inline function _fast_int(s::SubString{String})
+    n = ncodeunits(s)
+    n == 0 && return nothing
+    i = 1
+    b = codeunit(s, i)
+    neg = b == UInt8('-')
+    (neg || b == UInt8('+')) && (i += 1)
+    i > n && return nothing
+    n - i + 1 > 18 && return nothing
+    v = 0
+    @inbounds while i <= n
+        b = codeunit(s, i)
+        isdigit_b(b) || return nothing
+        v = v * 10 + Int(b - 0x30)
+        i += 1
+    end
+    return neg ? -v : v
+end
+
+# `parse(T, s)`, reading Float64 and Int without `Base.parse` when `s` is in the
+# form `_fast_float` or `_fast_int` reads.
+@inline fast_parse(::Type{T}, s::SubString{String}) where {T} = parse(T, s)
+@inline function fast_parse(::Type{Float64}, s::SubString{String})
+    v = _fast_float(s)
+    return v === nothing ? parse(Float64, s) : v
+end
+@inline function fast_parse(::Type{Int}, s::SubString{String})
+    v = _fast_int(s)
+    return v === nothing ? parse(Int, s) : v
+end
+
+# The token at `start` parsed as a `T`, and the position after it, as returned by
+# `iter_ws`. `start == 0` means the previous field ended the line, so the row has
+# fewer fields than its section declares; this raises the error `parse` gives on an
+# empty token.
+@noinline function parse_token(::Type{T}, ws::WordedString, start::Int) where {T}
+    start < 1 && return (fast_parse(T, NULL_VIEW), 0)
+    tok, nxt = iter_ws(ws, start)
+    return (fast_parse(T, tok), nxt)
+end
+
+@inline iter_num(::Type{T}, ws::WordedString, start::Int) where {T} = parse_token(T, ws, start)
+
+# For Float64, the token is scanned and parsed in one pass. The result is the same
+# value and position as `parse_token`: a number `scan_float` reads exactly that ends
+# at a delimiter or the end of the line. Anything else goes to `parse_token`.
+@inline function iter_num(::Type{Float64}, ws::WordedString, start::Int)
+    len = ws.len
+    if 1 <= start <= len
+        str = ws.s
+        i = start
+        @inbounds while i <= len && SPACE_B[codeunit(str, i) + 1]
+            i += 1
+        end
+        if i <= len && @inbounds(codeunit(str, i)) != UInt8('%')
+            r = scan_float(str, i, len)
+            if r !== nothing
+                v, j = r
+                (j > len || @inbounds(ENDS_B[codeunit(str, j) + 1])) && return (v, j)
+            end
+        end
+    end
+    return parse_token(Float64, ws, start)
 end
 
 macro iter_to_ntuple(n, iter_expr, types)
@@ -338,13 +485,16 @@ macro iter_to_ntuple(n, iter_expr, types)
 
     body = Expr[]
     push!(body, :($iter_sym = $(esc(iter_expr))))
-    push!(body, :($state_sym = iter_ws($iter_sym, 1)))
-    
+    pos_sym = gensym("pos")
+    push!(body, :($pos_sym = 1))
+
     length(types.args) != n && error("types provided to @iter_to_ntuple had length $(length(types.args)) instead of $n")
     for i in 1:n
-        push!(body, :($(x_syms[i]) = parse($(esc(types.args[i])), $state_sym[1])))
+        # one call per field: scans the token and parses it in a single pass
+        push!(body, :($state_sym = iter_num($(esc(types.args[i])), $iter_sym, $pos_sym)))
+        push!(body, :($(x_syms[i]) = $state_sym[1]))
         if i < n
-            push!(body, :($state_sym = $state_sym[2] == 0 ? (NULL_VIEW, 0) : iter_ws($iter_sym, $state_sym[2])))
+            push!(body, :($pos_sym = $state_sym[2]))
         end
     end
     push!(body, Expr(:tuple, x_syms...))
@@ -352,19 +502,53 @@ macro iter_to_ntuple(n, iter_expr, types)
     return Expr(:block, body...)
 end
 
-# The number of rows in the table opened at line `start`: the lines the parsing loop
-# reads as rows, so blank lines and `%` comment lines inside a table are not counted.
-function get_arr_len(lines :: Vector{SubString{String}}, num_lines::Int, start::Int)::Int
-    line_ind = start
-    n = 0
-    while line_ind < num_lines
-        line_ind += 1
-        line = lines[line_ind]
-        all(isspace, line) && continue
-        line[1] == ']' && return n
-        first(lstrip(line)) == '%' || (n += 1)
+# The line of `s` starting at byte `pos`, and the byte after its newline, or
+# `nothing` past the last line. The lines are those of
+# `split(replace(s, "\r\n" => "\n"), "\n")`: a `\r` before a newline is dropped,
+# and a string ending in a newline has an empty last line.
+@inline function next_line(s::String, pos::Int, n::Int)
+    if pos > n
+        (pos == n + 1 && (n == 0 || codeunit(s, n) == 0x0a)) &&
+            return (SubString(s, n + 1, n), n + 2)
+        return nothing
     end
-    error("Array defined on line $start was not closed")
+    # `findnext` over the code units uses memchr; over the String it decodes characters.
+    nl = findnext(==(0x0a), codeunits(s), pos)
+    # `thisind`: a line can end in a multibyte character, and a SubString must end
+    # at the first byte of its last character.
+    nl === nothing && return (SubString(s, pos, thisind(s, n)), n + 1)
+    last = nl > pos && codeunit(s, nl - 1) == 0x0d ? nl - 2 : nl - 1
+    return (SubString(s, pos, thisind(s, last)), nl + 1)
+end
+
+# Byte index of the first non-whitespace character of `line`, or 0 if it is blank.
+@inline function first_nonspace(line::SubString{String})
+    n = ncodeunits(line)
+    i = 1
+    @inbounds while i <= n
+        b = codeunit(line, i)
+        b >= 0x80 && return something(findnext(!isspace, line, i), 0)
+        SPACE_B[b + 1] || return i
+        i += 1
+    end
+    return 0
+end
+
+# The number of rows in the table whose first line starts at byte `pos`: the lines
+# the parsing loop reads as rows, so blank lines and `%` comment lines inside a
+# table are not counted.
+function get_arr_len(s::String, n::Int, pos::Int)::Int
+    count = 0
+    p = pos
+    while true
+        nxt = next_line(s, p, n)
+        nxt === nothing && error("Array beginning at byte $pos was not closed")
+        line, p = nxt
+        k = first_nonspace(line)
+        k == 0 && continue
+        line[1] == ']' && return count
+        codeunit(line, k) == UInt8('%') || (count += 1)
+    end
 end
 
 # MATPOWER reads a `rateA` of 0 as no limit. Like PowerModels' `calc_thermal_limits!`,
@@ -381,9 +565,8 @@ function thermal_limit(r::T, x::T, angmin::T, angmax::T, fr_vmax::T, to_vmax::T)
 end
 
 @inbounds @inline @views function parse_matpower_inner(::Type{T}, ::Type{V}, fname :: String, filtered :: Bool) where {T<:Real, V<:AbstractVector}
-    fstring = read(open(fname), String)
-    # CRLF files (and checkouts with autocrlf) leave a "\r" on every line.
-    lines = split(replace(fstring, "\r\n" => "\n"), "\n")
+    fstring = read(fname, String)
+    nbytes = ncodeunits(fstring)
     in_array = false
     cur_key = ""
     bus = BusData{T}[]
@@ -391,7 +574,6 @@ end
     skipped_gens = Int[]
     branch = BranchData{T}[]
     storage = StorageData{T}[]
-    num_lines = length(lines)
 
     row_num = 1
     version = ""
@@ -410,11 +592,17 @@ end
     biggest_gen_pmax = -Inf
     num_skipped_gens = 0
     cur_skipped_gen = 1
-    for line in lines
+    pos = 1
+    while true
+        nxt = next_line(fstring, pos, nbytes)
+        nxt === nothing && break
+        # `pos` now points at the next line, which is where `get_arr_len` starts.
+        line, pos = nxt
         line_len = line.ncodeunits
         line_ind += 1
-        !all(isspace, line) && first(lstrip(line)) == '%' && continue
-        if in_array && !all(isspace, line)
+        k = first_nonspace(line)
+        k != 0 && codeunit(line, k) == UInt8('%') && continue
+        if in_array && k != 0
             if startswith(line, "];")
                 if cur_key == "bus"
                     bus_offset = minimum(b -> b.bus_i, bus) - 1
@@ -573,7 +761,7 @@ end
             if in_array
                 row_num += 1
             end
-        elseif !startswith(line, "function") && line_len > 0 && isletter(line[1])
+        elseif line_len > 0 && !startswith(line, "function") && isletter(line[1])
             cur_key = ""
             for key in MATPOWER_KEYS
                 full_name = "mpc.$key ="
@@ -594,7 +782,7 @@ end
                 word = split(line)[3]
                 baseMVA = parse(T, word[1:length(word)-1]) :: T
             else
-                arr_len = get_arr_len(lines, num_lines, line_ind)
+                arr_len = get_arr_len(fstring, nbytes, pos)
                 if cur_key == "bus"
                     bus = V{BusData{T}}(undef, arr_len)
                 elseif cur_key == "gen"
@@ -683,31 +871,19 @@ end
         )
     end
 
+    # `t_idx` was set to `f_idx` plus the declared branch count. If filtering dropped
+    # branches, it is reset to `f_idx` plus the remaining count.
+    num_declared = num_branch
     num_branch = length(branch)
+    fix_t_idx = num_branch != num_declared
     arc = V{ArcData{T}}(undef, num_branch * 2)
     for (i, b) in enumerate(branch)
-        if filtered
+        if fix_t_idx
             branch[i] = BranchData{T}(
-                branch[i].i,
-                branch[i].f_bus,
-                branch[i].t_bus,
-                branch[i].br_r,
-                branch[i].br_x,
-                branch[i].b_fr,
-                branch[i].b_to,
-                branch[i].g_fr,
-                branch[i].g_to,
-                branch[i].rate_a,
-                branch[i].rate_b,
-                branch[i].rate_c,
-                branch[i].tap,
-                branch[i].shift,
-                branch[i].status,
-                branch[i].angmin,
-                branch[i].angmax,
-                branch[i].f_idx,
-                branch[i].f_idx + num_branch
-           )
+                b.i, b.f_bus, b.t_bus, b.br_r, b.br_x, b.b_fr, b.b_to,
+                b.g_fr, b.g_to, b.rate_a, b.rate_b, b.rate_c, b.tap, b.shift,
+                b.status, b.angmin, b.angmax, b.f_idx, b.f_idx + num_branch,
+            )
         end
         arc[i] = ArcData(i, b.f_bus, b.rate_a)
         arc[i+num_branch] = ArcData(i+num_branch, b.t_bus, b.rate_a)
