@@ -353,16 +353,16 @@ macro iter_to_ntuple(n, iter_expr, types)
 end
 
 # The number of rows in the table opened at line `start`: the lines the parsing loop
-# reads as rows, so empty lines and `%` comment lines inside a table are not counted.
+# reads as rows, so blank lines and `%` comment lines inside a table are not counted.
 function get_arr_len(lines :: Vector{SubString{String}}, num_lines::Int, start::Int)::Int
     line_ind = start
     n = 0
     while line_ind < num_lines
         line_ind += 1
         line = lines[line_ind]
-        line.ncodeunits == 0 && continue
+        all(isspace, line) && continue
         line[1] == ']' && return n
-        line[1] == '%' || (n += 1)
+        first(lstrip(line)) == '%' || (n += 1)
     end
     error("Array defined on line $start was not closed")
 end
@@ -382,7 +382,8 @@ end
 
 @inbounds @inline @views function parse_matpower_inner(::Type{T}, ::Type{V}, fname :: String, filtered :: Bool) where {T<:Real, V<:AbstractVector}
     fstring = read(open(fname), String)
-    lines = split(fstring, "\n")
+    # CRLF files (and checkouts with autocrlf) leave a "\r" on every line.
+    lines = split(replace(fstring, "\r\n" => "\n"), "\n")
     in_array = false
     cur_key = ""
     bus = BusData{T}[]
@@ -412,8 +413,8 @@ end
     for line in lines
         line_len = line.ncodeunits
         line_ind += 1
-        line_len != 0 && line[1] == '%' && continue
-        if in_array && line_len != 0
+        !all(isspace, line) && first(lstrip(line)) == '%' && continue
+        if in_array && !all(isspace, line)
             if startswith(line, "];")
                 if cur_key == "bus"
                     bus_offset = minimum(b -> b.bus_i, bus) - 1
