@@ -352,15 +352,32 @@ macro iter_to_ntuple(n, iter_expr, types)
     return Expr(:block, body...)
 end
 
+# The number of rows in the table opened at line `start`: the lines the parsing loop
+# reads as rows, so empty lines and `%` comment lines inside a table are not counted.
 function get_arr_len(lines :: Vector{SubString{String}}, num_lines::Int, start::Int)::Int
     line_ind = start
-    while line_ind <= num_lines
+    n = 0
+    while line_ind < num_lines
         line_ind += 1
-        if lines[line_ind][1] == ']'
-            return line_ind - start - 1
-        end
+        line = lines[line_ind]
+        line.ncodeunits == 0 && continue
+        line[1] == ']' && return n
+        line[1] == '%' || (n += 1)
     end
     error("Array defined on line $start was not closed")
+end
+
+# MATPOWER reads a `rateA` of 0 as no limit. Like PowerModels' `calc_thermal_limits!`,
+# replace it with a limit the voltage and angle-difference bounds already imply. The
+# angle difference is capped at pi, where the voltage difference is largest, so a case
+# with MATPOWER's unconstrained -360/360 gets the widest such limit rather than one near 0.
+function thermal_limit(r::T, x::T, angmin::T, angmax::T, fr_vmax::T, to_vmax::T) where {T}
+    theta_max = min(max(abs(angmin), abs(angmax)), T(pi))
+    z2 = r^2 + x^2
+    y_mag = iszero(z2) ? zero(T) : inv(sqrt(z2))
+    m_vmax = max(fr_vmax, to_vmax)
+    c_max = sqrt(fr_vmax^2 + to_vmax^2 - 2 * fr_vmax * to_vmax * cos(theta_max))
+    return y_mag * m_vmax * c_max
 end
 
 @inbounds @inline @views function parse_matpower_inner(::Type{T}, ::Type{V}, fname :: String, filtered :: Bool) where {T<:Real, V<:AbstractVector}
@@ -494,24 +511,33 @@ end
                 )
             elseif cur_key == "branch"
                 branch_words = @iter_to_ntuple 13 WordedString(line, line_len) (Int, Int, T, T, T, T, T, T, T, T, Int, T, T)
+                f_bus = bus_map[branch_words[1] - bus_offset]
+                t_bus = bus_map[branch_words[2] - bus_offset]
+                angmin = branch_words[12] / T(180.0) * T(pi)
+                angmax = branch_words[13] / T(180.0) * T(pi)
+                rate_a = branch_words[6] / baseMVA
+                if rate_a <= 0
+                    rate_a = thermal_limit(branch_words[3], branch_words[4], angmin, angmax,
+                                           bus[f_bus].vmax, bus[t_bus].vmax)
+                end
                 branch[row_num] = BranchData{T}(
                     row_num,
-                    bus_map[branch_words[1] - bus_offset],
-                    bus_map[branch_words[2] - bus_offset],
+                    f_bus,
+                    t_bus,
                     branch_words[3],
                     branch_words[4],
                     branch_words[5] / T(2.0),
                     branch_words[5] / T(2.0),
                     T(0.0),
                     T(0.0),
-                    branch_words[6] / baseMVA,
+                    rate_a,
                     branch_words[7] / baseMVA,
                     branch_words[8] / baseMVA,
                     branch_words[9],
                     (branch_words[10]) / T(180.0) * T(pi),
                     branch_words[11],
-                    branch_words[12] / T(180.0) * T(pi),
-                    branch_words[13] / T(180.0) * T(pi),
+                    angmin,
+                    angmax,
                     cur_branch,
                     cur_branch + num_branch
                 )
