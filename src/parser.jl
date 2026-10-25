@@ -186,8 +186,8 @@ end
     struct StorageData{T <: Real}
         i :: Int
         storage_bus :: Int
-        ps :: T
-        qs :: T
+        Pexts :: T
+        Qexts :: T
         energy :: T
         energy_rating :: T
         charge_rating :: T
@@ -197,8 +197,8 @@ end
         thermal_rating :: T
         qmin :: T
         qmax :: T
-        r :: T
-        x :: T
+        Zr :: T
+        Zim :: T
         p_loss :: T
         q_loss :: T
         status :: Int
@@ -753,8 +753,8 @@ end
                     storage_words[12] / baseMVA,
                     storage_words[13],
                     storage_words[14],
-                    storage_words[15],
-                    storage_words[16],
+                    storage_words[15] / baseMVA,
+                    storage_words[16] / baseMVA,
                     storage_words[17],
                 )
             end
