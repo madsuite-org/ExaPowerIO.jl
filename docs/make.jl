@@ -27,4 +27,4 @@ makedocs(;
     clean = false
 )
 
-deploydocs(repo = "github.com/MadNLP/ExaPowerIO.jl.git"; push_preview = true)
+deploydocs(repo = "github.com/madsuite-org/ExaPowerIO.jl.git"; push_preview = true)
