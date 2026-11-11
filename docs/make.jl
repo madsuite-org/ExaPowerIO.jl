@@ -16,6 +16,7 @@ makedocs(;
     remotes = nothing,
     authors = "Archim Jhunjhunwala",
     format = Documenter.HTML(
+        assets = ["assets/favicon.ico"],
         prettyurls = true,
         sidebar_sitename = true,
         collapselevel = 1,
