@@ -128,7 +128,16 @@ end
 function test_case(ep_filtered, ep_unfiltered, pm_output, pm_log, dataset)
     # when the reference bus gets changed, and there is a tie in pmax, the new ref is unknown
     if occursin("as reference based on generator", pm_log)
-        @info "Skipping case $dataset due to changed reference bus"
+        # The new reference is the bus of the in-service generator with the largest
+        # PMAX. With a tie in PMAX, which of them PowerModels picks is unknown, so the
+        # reference is compared only when the largest PMAX is unique.
+        pmax = [g.pmax for g in ep_filtered.gen]
+        if count(==(maximum(pmax)), pmax) == 1
+            ep_ref = [b.bus_i for b in ep_filtered.bus if b.type == 3]
+            pm_ref = [b.bus_i for b in values(pm_output.bus) if b.type == 3]
+            @test ep_ref == pm_ref
+        end
+        @info "Skipping the rest of case $dataset due to changed reference bus"
         return
     end
     @test pm_output.version == ep_filtered.version

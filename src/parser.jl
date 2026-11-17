@@ -637,8 +637,10 @@ end
                 end
             elseif cur_key == "gen"
                 gen_words = @iter_to_ntuple 10 WordedString(line, line_len) (Int, T, T, T, T, T, T, Int, T, T)
-                if gen_words[8] != 0 && gen_words[10] > biggest_gen_pmax
-                    biggest_gen_pmax = gen_words[10]
+                # Column 9 is PMAX (10 is PMIN): a reference bus without an in-service
+                # generator is replaced by the bus of the one with the largest PMAX.
+                if gen_words[8] != 0 && gen_words[9] > biggest_gen_pmax
+                    biggest_gen_pmax = gen_words[9]
                     biggest_gen = row_num
                 end
                 gen[row_num] = GenData(
